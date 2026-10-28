@@ -1,0 +1,38 @@
+# Min Dark: the VS Code theme by Miguel Solorio, as an Omarchy theme.
+# Gray chrome, gray text, and color only where code needs it. Values come from
+# min-theme's themes/min-dark.json; the few it doesn't define (green, the bright
+# variants) come from GitHub Dark, the palette Min's syntax colors are drawn from.
+mode = "dark"
+
+accent = "#c1c1c1"
+selection = "#383838"
+muted = "#727272"
+
+background = "#1f1f1f"
+dark_background = "#1a1a1a"
+darker_background = "#161616"
+lighter_background = "#2a2a2a"
+
+foreground = "#c1c1c1"
+dark_foreground = "#484848"
+light_foreground = "#888888"
+bright_foreground = "#fafafa"
+
+red = "#f97583"
+yellow = "#ffab70"
+orange = "#ff9800"
+green = "#85e89d"
+cyan = "#9db1c5"
+blue = "#79b8ff"
+magenta = "#b392f0"
+brown = "#6b737c"
+
+bright_red = "#ff7a84"
+bright_yellow = "#ffc49b"
+bright_green = "#aaefba"
+bright_cyan = "#bac8d6"
+bright_blue = "#9ecbff"
+bright_magenta = "#cab3f4"
+
+hyprland_active_border = "#c1c1c1"
+hyprland_inactive_border = "rgba(2a2a2aff)"
