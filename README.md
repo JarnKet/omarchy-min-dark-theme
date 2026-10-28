@@ -59,8 +59,18 @@ variants are lighter steps of the same colors.
 - `btop.theme`: gray boxes; only the graphs carry color.
 - `vscode.json`, `neovim.lua`: the original Min Dark in the editors (see above).
 - `icons.theme`: `Yaru-gray`.
-- `backgrounds/1-min-code.png`: a few lines of TypeScript as VS Code shows them
-  in Min Dark, rendered by `tools/make-wallpaper.py` from `colors.toml`.
+- `backgrounds/`: seven wallpapers, all drawn by `tools/make-wallpaper.py`
+  from `colors.toml` and Min Dark's token colors (`make-wallpaper.py all`, or
+  name the ones to redo):
+  1. **code**: a few lines of TypeScript as VS Code shows them in Min Dark
+  2. **aurora**: soft lavender and blue light, macOS-style
+  3. **dusk**: the same in pink and orange, low on the screen
+  4. **window**: the code in a macOS-style window over the aurora
+  5. **dots**: a dot grid, one dot in Min's lavender
+  6. **mountains**: a night range with mist, stars and a lavender moon
+  7. **hills**: rounder hills at dawn
+
+  Cycle them with `omarchy theme bg next`.
 - `preview.png`: the theme switcher thumbnail, from `tools/make-preview.sh`
   (takes over an empty workspace for about 10 seconds).
   `tools/palette.sh` prints the terminal palette.
