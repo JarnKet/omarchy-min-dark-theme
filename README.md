@@ -93,9 +93,9 @@ ln -s ~/Projects/min-dark-theme ~/.config/omarchy/themes/min-dark
 
 The idea and the choices are mine: a Min Dark desktop, a white-gray accent
 instead of a color, and wallpapers that all look like the topography one.
-The files were written by Claude
-(Anthropic's AI) in Claude Code from what I asked for. I tried the theme on my
-own machine and take responsibility for what's here.
+The files were written by Claude (Anthropic's AI) in Claude Code from what I
+asked for. I tried the theme on my own machine and take responsibility for
+what's here.
 
 ## Credits
 
