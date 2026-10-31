@@ -59,19 +59,21 @@ variants are lighter steps of the same colors.
 - `btop.theme`: gray boxes; only the graphs carry color.
 - `vscode.json`, `neovim.lua`: the original Min Dark in the editors (see above).
 - `icons.theme`: `Yaru-gray`.
-- `backgrounds/`: eight wallpapers, all drawn by `tools/make-wallpaper.py`
-  from `colors.toml` and Min Dark's token colors (`make-wallpaper.py all`, or
-  name the ones to redo):
-  1. **code**: a few lines of TypeScript as VS Code shows them in Min Dark
-  2. **silk**: twisting ribbons of silk, lit from above, the back ones out of
-     focus
-  3. **dunes**: sand dunes at dusk, their crests catching a low sun
-  4. **lake**: a mountain lake at night, the moon's path on the water, pines
-     on the shore
-  5. **planet**: a banded planet's lit limb rising into a starfield
-  6. **flow**: thousands of hairlines streaming along a smooth flow field
-  7. **topography**: contour lines of an imaginary terrain, one in lavender
-  8. **window**: an editor and a terminal as macOS-style windows over the silk
+- `backgrounds/`: nine wallpapers in one style, all drawn by
+  `tools/make-wallpaper.py` from `colors.toml` (`make-wallpaper.py all`, or
+  name the ones to redo). Each is a quiet chart: gray hairlines on near-black,
+  a few small mono labels, and one feature in one of Min's syntax colors.
+  1. **topography**: contour lines of an imaginary terrain, one in lavender
+  2. **ridgelines**: stacked elevation profiles across a range, one in pink
+  3. **rivers**: the stream network of one basin, the main river in blue
+  4. **globe**: a wireframe globe with the land in dots, the flight from
+     Singapore to San Francisco along its great circle in orange
+  5. **circuit**: chips and traces on a circuit board, one trace in green
+  6. **lunar**: a crater field as contours, one crater's wall in orange
+  7. **nautical**: a coast with depth contours, soundings and a compass
+     rose, the 20 m line in blue
+  8. **stars**: a star chart of invented constellations, one in lavender
+  9. **rings**: the growth rings of a sawn log, one ring in green
 
   Cycle them with `omarchy theme bg next`.
 - `preview.png`: the theme switcher thumbnail, from `tools/make-preview.sh`
@@ -90,7 +92,8 @@ ln -s ~/Projects/min-dark-theme ~/.config/omarchy/themes/min-dark
 ## How this was made
 
 The idea and the choices are mine: a Min Dark desktop, a white-gray accent
-instead of a color, and a code wallpaper. The files were written by Claude
+instead of a color, and wallpapers that all look like the topography one.
+The files were written by Claude
 (Anthropic's AI) in Claude Code from what I asked for. I tried the theme on my
 own machine and take responsibility for what's here.
 
@@ -99,7 +102,9 @@ own machine and take responsibility for what's here.
 The colors are [Min Theme](https://github.com/miguelsolorio/min-theme)'s, by
 Miguel Solorio (MIT). The Neovim colorscheme is
 [min-theme.nvim](https://github.com/datsfilipe/min-theme.nvim) by datsfilipe
-(MIT). Not affiliated with either.
+(MIT). Not affiliated with either. The globe's land is from
+[Natural Earth](https://www.naturalearthdata.com/) (public domain), kept in
+`tools/world-land.png`.
 
 ## License
 

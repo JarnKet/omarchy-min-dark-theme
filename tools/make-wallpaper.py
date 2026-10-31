@@ -1,26 +1,29 @@
 #!/usr/bin/env python3
 """Render the Min Dark wallpapers into backgrounds/.
 
-  code        a few lines of TypeScript as VS Code shows them in Min Dark: line
-              numbers, an indent guide, the current line outlined in Min's
-              #303030 across the whole screen, the cursor at its end
-  silk        twisting ribbons of silk in Min's colors, lit from above, the back
-              ones out of focus
-  dunes       sand dunes at dusk: faces turned to a low sun and faces in shade
-  lake        a mountain lake at night: the moon's path on the water, mist on
-              the far shore, pines in front
-  planet      the lit limb of a banded planet rising into a starfield
-  flow        thousands of hairlines drawn along a smooth flow field
-  topography  contour lines of an imaginary terrain, one traced in lavender
-  window      an editor and a terminal as macOS-style windows over the silk
+One series of quiet charts, all drawn the same way: hairlines in two grays on
+near-black, a few small mono labels, and one feature picked out in one of
+Min's syntax colors.
 
-Every color comes from colors.toml or Min Dark's token colors, and each
-picture keeps its subject inside the middle 3456 px so a 16:10 crop keeps it.
+  topography  contour lines of an imaginary terrain, one in lavender
+  ridgelines  stacked elevation profiles across a range, one in pink
+  rivers      the river network draining a range, the main river in blue
+  globe       a wireframe globe with the land in dots, the flight from
+              Singapore to San Francisco in orange
+  circuit     a circuit board's chips and traces, one trace in green
+  lunar       a crater field as contours, one crater's wall in orange
+  nautical    a coast with depth contours and soundings, the 20 m line in blue
+  stars       a star chart of invented constellations, one in lavender
+  rings       the growth rings of a sawn log, one ring in green
+
+Every color comes from colors.toml, and each picture keeps its subject inside
+the middle 3456 px so a 16:10 crop keeps it.
 
 Usage: tools/make-wallpaper.py [name ...|all] [--width 3840 --height 2160] [--seed N]
 """
 
 import argparse
+import heapq
 import math
 import os
 import re
@@ -31,7 +34,7 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 THEME_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FONT = "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf"
-UI_FONT = "/usr/share/fonts/noto/NotoSans-Medium.ttf"
+LAND = os.path.join(THEME_DIR, "tools", "world-land.png")  # Natural Earth 1:50m, 0.1° a pixel
 
 
 def theme_colors():
@@ -41,37 +44,17 @@ def theme_colors():
 
 C = theme_colors()
 
-# Token colors, by min-dark.json scope. The ones colors.toml has no key for are
-# spelled out.
-DEFAULT = C["magenta"]        # the scope-less rule: plain identifiers are lavender
-KEYWORD = C["red"]            # keyword, storage.type, keyword.operator
-FUNCTION = C["magenta"]       # entity.name.function, meta.function-call
-CONSTANT = C["blue"]          # support.type, variable.other.object
-PARAMETER = C["orange"]       # variable.parameter.function
-COMMENT = C["brown"]          # comment
-PUNCTUATION = "#bbbbbb"       # punctuation.separator, punctuation.definition.arguments
-NUMBER = "#f8f8f8"            # constant.numeric
-LINE_NUMBER = C["muted"]      # editorLineNumber.foreground
-LINE_NUMBER_ACTIVE = C["foreground"]
-INDENT_GUIDE = C["lighter_background"]  # editorIndentGuide.background, #2a2a2a
-LINE_BORDER = "#303030"       # editor.lineHighlightBorder
-CURSOR = C["foreground"]
-
-K, F, T, P, D, N, X, S = KEYWORD, FUNCTION, CONSTANT, PARAMETER, DEFAULT, NUMBER, COMMENT, PUNCTUATION
-
-CODE = [
-    [("// less, but better.", X)],
-    [("export", K), (" ", D), ("function", K), (" ", D), ("min", F), ("(", S), ("...", K), ("values", P),
-     (":", K), (" ", D), ("number", T), ("[]", S), (")", S), (":", K), (" ", D), ("number", T), (" ", D), ("{", S)],
-    [("  ", D), ("return", K), (" ", D), ("values", T), (".", F), ("reduce", F), ("((", S), ("a", P), (", ", S),
-     ("b", P), (")", S), (" ", D), ("=>", K), (" ", D), ("(", S), ("a", D), (" ", D), ("<", K), (" ", D), ("b", D),
-     (" ", D), ("?", K), (" ", D), ("a", D), (" ", D), (":", K), (" ", D), ("b", D), ("));", S)],
-    [("}", S)],
-    [],
-    [("min", F), ("(", S), ("3", N), (", ", S), ("1", N), (", ", S), ("2", N), (");", S), (" ", D), ("// 1", X)],
-]
-ACTIVE = 5            # the line holding the cursor, from 0
-INDENTED = (2,)       # lines inside the function body get an indent guide
+GROUND = "#1b1b1d"
+MINOR = "#343437"             # a line among many
+MAJOR = "#4c4c50"             # every fifth line, outlines
+LABEL = C["light_foreground"]
+MARK = C["foreground"]
+# The one accent each picture gets: Min's syntax colors.
+LAVENDER = C["magenta"]       # functions
+PINK = C["red"]               # keywords
+BLUE = C["blue"]              # constants
+ORANGE = C["yellow"]          # strings
+GREEN = C["green"]
 
 
 def rgb(color):
@@ -87,6 +70,10 @@ def mix(a, b, t):
     return a + (b - a) * t
 
 
+def hexmix(a, b, t):
+    return "#%02x%02x%02x" % tuple(round(float(v)) for v in mix(col(a), col(b), t))
+
+
 def smoothstep(e0, e1, x):
     t = np.clip((x - e0) / (e1 - e0), 0.0, 1.0)
     return t * t * (3 - 2 * t)
@@ -95,13 +82,6 @@ def smoothstep(e0, e1, x):
 def coords(w, h):
     yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
     return xx, yy
-
-
-def gradient(w, h, stops):
-    """A vertical gradient through (position 0..1, color) stops."""
-    ys = np.linspace(0, 1, h, dtype=np.float32)
-    chans = [np.interp(ys, [p for p, _ in stops], [rgb(c)[i] for _, c in stops]) for i in range(3)]
-    return np.broadcast_to(np.stack(chans, -1)[:, None, :], (h, w, 3)).astype(np.float32)
 
 
 def noise(w, h, rng, cell, octaves=5, persistence=0.5):
@@ -119,28 +99,19 @@ def noise(w, h, rng, cell, octaves=5, persistence=0.5):
     return (out - out.min()) / (out.max() - out.min() + 1e-6)
 
 
-def add_glow(arr, xx, yy, cx, cy, sigma, color, strength):
-    g = np.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * sigma * sigma))
-    arr += g[..., None] * (col(color) * strength)
+def normalize(a):
+    return (a - a.min()) / (a.max() - a.min())
 
 
-def add_stars(arr, rng, count, top, bottom, tint="#e8e4f4", s=1.0):
-    """Small soft points, most faint, a few bright with a halo."""
-    h, w, _ = arr.shape
-    c = col(tint)
-    for _ in range(count):
-        x, y = rng.uniform(0, w), top * h + (bottom - top) * h * rng.random() ** 1.6
-        r = rng.choice([0.55, 0.75, 1.0, 1.4], p=[0.45, 0.3, 0.17, 0.08]) * s
-        b = rng.uniform(0.15, 1.0) ** 2.2
-        halo = r > 1.2 * s
-        reach = int(math.ceil((9 if halo else 4) * r)) + 1
-        x0, x1, y0, y1 = max(0, int(x) - reach), min(w, int(x) + reach + 1), max(0, int(y) - reach), min(h, int(y) + reach + 1)
-        py, px = np.mgrid[y0:y1, x0:x1].astype(np.float32)
-        d2 = (px - x) ** 2 + (py - y) ** 2
-        g = np.exp(-d2 / (2 * r * r)) * 1.7
-        if halo:
-            g += np.exp(-d2 / (2 * (4 * r) ** 2)) * 0.12
-        arr[y0:y1, x0:x1] += g[..., None] * (c * b)
+def ground(w, h):
+    return np.zeros((h, w, 3), np.float32) + col(GROUND)
+
+
+def relief(arr, field, strength=5):
+    """Shade arr very slightly as if field were lit from the top left."""
+    gy, gx = np.gradient(field)
+    shade = np.clip((-gx * 0.7 - gy * 0.7) * 900, -1, 1)
+    arr += (shade * strength)[..., None]
 
 
 def vignette(arr, amount=0.3):
@@ -167,402 +138,150 @@ def paint(arr, cover, color):
     return arr
 
 
-# --- code --------------------------------------------------------------------
-
-def code_metrics(scale):
-    size = round(34 * scale)
-    font = ImageFont.truetype(FONT, size)
-    cell = font.getlength("M")
-    line_h = round(size * 1.7)
-    gutter, gap = 4 * cell, 3 * cell  # right-aligned line numbers, then a gap
-    widest = max(sum(len(t) for t, _ in line) for line in CODE)
-    return {"font": font, "cell": cell, "line_h": line_h, "gutter": gutter, "gap": gap,
-            "w": gutter + gap + widest * cell, "h": len(CODE) * line_h}
-
-
-def draw_code(img, x0, y0, scale, line_span=None):
-    """Draw CODE with its gutter's left edge at (x0, y0). The current line's
-    border runs across line_span (left, right), the whole image by default."""
-    m = code_metrics(scale)
-    font, cell, line_h = m["font"], m["cell"], m["line_h"]
-    draw = ImageDraw.Draw(img)
-    code_x = x0 + m["gutter"] + m["gap"]
-    ascent, descent = font.getmetrics()
-
-    border = max(1, round(2 * scale))
-    top = y0 + ACTIVE * line_h
-    left, right = line_span or (-border, img.width + border)
-    draw.rectangle([left, top, right, top + line_h - 1], outline=LINE_BORDER, width=border)
-
-    for i, line in enumerate(CODE):
-        # Centre the glyphs in the line box.
-        y = y0 + i * line_h + (line_h - ascent - descent) / 2
-        number = str(i + 1)
-        draw.text((x0 + m["gutter"] - len(number) * cell, y), number, font=font,
-                  fill=LINE_NUMBER_ACTIVE if i == ACTIVE else LINE_NUMBER)
-        if i in INDENTED:
-            gx = round(code_x)
-            draw.line([(gx, y0 + i * line_h), (gx, y0 + (i + 1) * line_h - 1)], fill=INDENT_GUIDE,
-                      width=max(1, round(scale)))
-        x = code_x
-        for text, color in line:
-            draw.text((x, y), text, font=font, fill=color)
-            x += len(text) * cell
-        if i == ACTIVE:
-            cursor_w = max(2, round(3 * scale))
-            draw.rectangle([round(x) + 1, top + round(line_h * 0.18), round(x) + cursor_w, top + round(line_h * 0.82)],
-                           fill=CURSOR)
+def contour_lines(arr, field, levels, s, every=5, widths=(0.9, 1.5), minor=MINOR, major=MAJOR,
+                  accent=None, accent_level=None, where=None, mask=None):
+    """Draw the contours of field (where field * levels crosses a whole
+    number) onto arr as smooth hairlines: every `every`th one wider and in
+    `major`, the one at `accent_level` (only `where`, if given) in `accent`.
+    `mask` (0..1) hides lines."""
+    gy, gx = np.gradient(field)
+    v = field * levels
+    grad = np.hypot(gx, gy) * levels + 1e-6
+    level = np.round(v)
+    dist = np.abs(v - level) / grad                      # pixels to the nearest contour
+    index = (level % every == 0)
+    width = np.where(index, widths[1], widths[0]) * s
+    line = np.clip(width + 0.5 - dist, 0, 1)
+    color = np.where(index[..., None], col(major), col(minor))
+    opacity = 0.95
+    if accent is not None:
+        special = level == accent_level
+        if where is not None:
+            special &= where
+        color = np.where(special[..., None], col(accent), color)
+        opacity = np.where(special, 1.0, 0.95)
+    if mask is not None:
+        line = line * mask
+    paint(arr, line * opacity, color)
 
 
-def render_code(w, h, seed):
-    scale = h / 2160
-    img = Image.new("RGB", (w, h), C["background"])
-    m = code_metrics(scale)
-    draw_code(img, round((w - m["w"]) / 2), round((h - m["h"]) / 2), scale)
-    return img
+class Plate:
+    """Line work for a picture, drawn three times the size and scaled down so
+    hairlines come out smooth, over a float RGB array (the ground, and any
+    contours already on it). Labels go on last, at full size, crisp."""
+
+    SS = 3
+
+    def __init__(self, arr):
+        self.h, self.w = arr.shape[:2]
+        base = Image.fromarray(np.clip(arr + 0.5, 0, 255).astype(np.uint8))
+        self.img = base.resize((self.w * self.SS, self.h * self.SS), Image.NEAREST)
+        self.draw = ImageDraw.Draw(self.img)
+        self.labels = []
+
+    def _xy(self, points):
+        k = self.SS
+        return [(float(x) * k, float(y) * k) for x, y in points]
+
+    def _px(self, width):
+        return max(1, round(width * self.SS))
+
+    def line(self, points, color, width):
+        if len(points) > 1:
+            self.draw.line(self._xy(points), fill=color, width=self._px(width), joint="curve")
+
+    def stroke(self, points, widths, colors):
+        """A polyline whose width and color change along it, one of each per
+        point; drawn in runs where they hold steady."""
+        run, key = [points[0]], (self._px(widths[0]), colors[0])
+        for p, wd, c in zip(points[1:], widths[1:], colors[1:]):
+            run.append(p)
+            k = (self._px(wd), c)
+            if k != key:
+                self.draw.line(self._xy(run), fill=key[1], width=key[0], joint="curve")
+                run, key = [p], k
+        if len(run) > 1:
+            self.draw.line(self._xy(run), fill=key[1], width=key[0], joint="curve")
+
+    def dashed(self, points, color, width, dash, gap):
+        pts = np.asarray(points, np.float64)
+        seg = np.hypot(*np.diff(pts, axis=0).T)
+        at = np.concatenate([[0], np.cumsum(seg)])
+        start = 0.0
+        while start < at[-1]:
+            end = min(start + dash, at[-1])
+            t = np.linspace(start, end, max(2, int((end - start) / 4) + 2))
+            self.line(list(zip(np.interp(t, at, pts[:, 0]), np.interp(t, at, pts[:, 1]))), color, width)
+            start = end + gap
+
+    def polygon(self, points, fill):
+        self.draw.polygon(self._xy(points), fill=fill)
+
+    def circle(self, x, y, r, fill=None, outline=None, width=1.0):
+        k = self.SS
+        box = [(x - r) * k, (y - r) * k, (x + r) * k, (y + r) * k]
+        if outline:
+            self.draw.ellipse(box, fill=fill, outline=outline, width=self._px(width))
+        else:
+            self.draw.ellipse(box, fill=fill)
+
+    def rect(self, x0, y0, x1, y1, fill=None, outline=None, width=1.0):
+        k = self.SS
+        box = [x0 * k, y0 * k, x1 * k, y1 * k]
+        if outline:
+            self.draw.rectangle(box, fill=fill, outline=outline, width=self._px(width))
+        else:
+            self.draw.rectangle(box, fill=fill)
+
+    def summit(self, x, y, s):
+        """The topography wallpaper's summit mark: a small solid triangle."""
+        r = 7 * s
+        self.polygon([(x, y - r), (x - r, y + r * 0.8), (x + r, y + r * 0.8)], MARK)
+
+    def label(self, x, y, text, s, color=LABEL, size=26, anchor="ls"):
+        self.labels.append((x, y, text, color, round(size * s), anchor))
+
+    def finish(self, seed, vignette_amount=0.25, grain=1.0):
+        arr = np.asarray(self.img.resize((self.w, self.h), Image.BOX), np.float32)
+        img = finish(vignette(arr, vignette_amount), seed, grain)
+        d = ImageDraw.Draw(img)
+        for x, y, text, color, size, anchor in self.labels:
+            d.text((x, y), text, font=ImageFont.truetype(FONT, size), fill=color, anchor=anchor)
+        return img
 
 
-# --- shapes ------------------------------------------------------------------
-
-def squircle_mask(w, h, radius, power=4, supersample=4):
-    """An antialiased rounded rectangle whose corners are superellipses, like
-    Hyprland's rounding_power and Apple's continuous corners."""
-    mask = Image.new("L", (w, h), 255)
-    n = radius * supersample
-    yy, xx = np.mgrid[0:n, 0:n].astype(np.float32) + 0.5
-    inside = ((1 - xx / n) ** power + (1 - yy / n) ** power) <= 1
-    corner = Image.fromarray(inside.astype(np.uint8) * 255).resize((radius, radius), Image.LANCZOS)
-    for flip_x, flip_y, pos in ((False, False, (0, 0)), (True, False, (w - radius, 0)),
-                                (False, True, (0, h - radius)), (True, True, (w - radius, h - radius))):
-        c = corner
-        if flip_x:
-            c = c.transpose(Image.FLIP_LEFT_RIGHT)
-        if flip_y:
-            c = c.transpose(Image.FLIP_TOP_BOTTOM)
-        mask.paste(c, pos)
-    return mask
+def chaikin(points, n=2):
+    """Round a polyline's corners, keeping its two ends."""
+    pts = np.asarray(points, np.float64)
+    for _ in range(n):
+        if len(pts) < 3:
+            break
+        q = 0.75 * pts[:-1] + 0.25 * pts[1:]
+        r = 0.25 * pts[:-1] + 0.75 * pts[1:]
+        mid = np.empty((2 * len(q), 2))
+        mid[0::2], mid[1::2] = q, r
+        pts = np.vstack([pts[:1], mid[1:-1], pts[-1:]])
+    return pts
 
 
-def ridge(w, rng, roughness, smooth=0):
-    """A 1D fractal skyline in -1..1 by midpoint displacement; `smooth` drops
-    the finest octaves for rounder hills."""
-    n = 1 << math.ceil(math.log2(w))
-    hgt = np.zeros(n + 1)
-    hgt[[0, n]] = rng.uniform(-1, 1, 2)
-    step, amp, level = n, 1.0, 0
-    while step > 1:
-        half = step // 2
-        mids = np.arange(half, n, step)
-        noise = rng.normal(0, amp, len(mids)) if level < 14 - smooth else 0
-        hgt[mids] = (hgt[mids - half] + hgt[mids + half]) / 2 + noise
-        amp *= roughness
-        step = half
-        level += 1
-    hgt = np.interp(np.linspace(0, n, w), np.arange(n + 1), hgt)
-    return hgt / (np.abs(hgt).max() or 1)
-
-
-# --- silk --------------------------------------------------------------------
-
-def silk(w, h, seed, ribbons=None):
-    """Twisting ribbons, lit from above: a bright fold near the lit edge, the
-    underside darker where a ribbon turns over, a soft shadow cast below each,
-    and the back ones softer, as if out of focus."""
-    xx, yy = coords(w, h)
-    X = xx / w
-    arr = gradient(w, h, [(0, "#16141b"), (0.55, "#121116"), (1, "#0e0e11")]).copy()
-    add_glow(arr, xx, yy, 0.58 * w, 0.42 * h, 0.42 * h, C["magenta"], 0.07)
-    add_glow(arr, xx, yy, 0.30 * w, 0.75 * h, 0.35 * h, C["blue"], 0.04)
-    gray = col(C["dark_background"])
-    white = col("#ffffff")
-    for y0, tilt, amp, freq, phase, width, twist, tphase, color, depth in ribbons:
-        c = h * (y0 + tilt * (X - 0.5) + amp * np.sin(2 * np.pi * (freq * X + phase))
-                 + 0.35 * amp * np.sin(2 * np.pi * (2.3 * freq * X + 1.7 * phase)))
-        tw = np.sin(2 * np.pi * (twist * X + tphase))
-        half = h * width * (0.10 + 0.90 * np.abs(tw))
-        # The shadow it casts on what's behind it.
-        ts = (yy - c - 0.04 * h) / (half * 1.3)
-        arr *= (1 - (1 - smoothstep(0.4, 1.6, np.abs(ts))) * (0.30 + 0.25 * depth))[..., None]
-        t = (yy - c) / half
-        soft = (1.2 + 9.0 * (1 - depth)) / half
-        inside = smoothstep(-1 - soft, -1 + soft, t) * (1 - smoothstep(1 - soft, 1 + soft, t))
-        tc = np.clip(t, -1, 1)
-
-        def face(side, dim):
-            # 1 at the lit edge: shading falls off across the width, with a
-            # bright fold near the lit edge and a broad sheen.
-            shade = (0.20 + 0.80 * ((side + 1) / 2) ** 1.7) * dim
-            fold = np.exp(-((side - 0.74) / 0.10) ** 2) * (0.20 + 0.55 * np.abs(tw)) * dim
-            sheen = np.exp(-((side + 0.2) / 0.45) ** 2) * 0.10
-            return shade + sheen, fold
-
-        # Where the ribbon turns over (tw crosses zero, at its narrowest) the
-        # front blends into the darker back face instead of jumping.
-        front = smoothstep(-0.35, 0.35, tw)
-        shade_f, fold_f = face(-tc, 1.0)
-        shade_b, fold_b = face(tc, 0.62)
-        shade = mix(shade_b, shade_f, front)
-        fold = mix(fold_b, fold_f, front)
-        base = mix(gray, col(color), 0.66)
-        rib = base * shade[..., None] + white * (fold * 0.42)[..., None]
-        rib *= 0.50 + 0.50 * depth
-        paint(arr, inside * 0.95, rib)
-    return arr
-
-
-SILK = [
-    # y, tilt, amplitude, frequency, phase, half-width, twists, twist phase, color, depth
-    (0.30, -0.22, 0.05, 0.60, 0.70, 0.085, 0.55, 0.15, "#6b5a99", 0.0),
-    (0.72, -0.20, 0.05, 0.75, 0.10, 0.080, 0.80, 0.30, C["cyan"], 0.15),
-    (0.58, -0.34, 0.07, 0.65, 0.55, 0.115, 0.65, 0.05, C["blue"], 0.40),
-    (0.46, -0.40, 0.06, 0.80, 0.20, 0.140, 0.55, 0.62, C["magenta"], 0.75),
-    (0.64, -0.26, 0.05, 1.05, 0.85, 0.060, 1.15, 0.40, C["red"], 1.0),
-]
-
-
-def render_silk(w, h, seed):
-    return finish(vignette(silk(w, h, seed, SILK), 0.35), seed)
-
-
-# --- dunes -------------------------------------------------------------------
-
-def render_dunes(w, h, seed):
-    rng = np.random.default_rng(seed)
-    xx, yy = coords(w, h)
-    x = np.arange(w, dtype=np.float32) / w
-    hz = 0.56
-    arr = gradient(w, h, [(0, "#120f16"), (0.28, "#1b151d"), (hz, "#4d2d36"), (1, "#24181f")]).copy()
-    sx, sy = 0.63 * w, 0.535 * h
-    add_glow(arr, xx, yy, sx, sy, 0.34 * h, C["red"], 0.16)
-    add_glow(arr, xx, yy, sx, sy, 0.11 * h, C["yellow"], 0.30)
-    disc = smoothstep(0.046 * h + 1, 0.046 * h - 1, np.hypot(xx - sx, yy - sy))
-    paint(arr, disc, col("#ffd9bd"))
-    add_stars(arr, rng, int(160 * w * h / 8.3e6), 0.0, 0.30, s=h / 2160)
-
-    layers = [
-        # base, amplitude, frequency, lit color, shadow color, haze
-        (0.585, 0.022, 2.3, "#8c5a5c", "#47303a", 0.60),
-        (0.625, 0.036, 1.7, "#9d5e55", "#3a2832", 0.42),
-        (0.690, 0.052, 1.25, "#b06650", "#2c1f27", 0.24),
-        (0.785, 0.066, 0.95, "#ba6a4e", "#21171d", 0.10),
-        (0.905, 0.072, 0.70, "#a85c45", "#170f14", 0.0),
-    ]
-    haze_color = col("#5a3640")
-    glow = col("#ffc9a8")
-    for base, amp, freq, lit_c, dark_c, haze in layers:
-        # Rolling crests, a little skewed, so the slope (and the light) changes smoothly.
-        u = freq * x + rng.random() + 0.10 * np.sin(2 * np.pi * (0.7 * freq * x + rng.random()))
-        crest = 0.5 + 0.5 * np.sin(2 * np.pi * u) + 0.22 * np.sin(2 * np.pi * (2.2 * freq * x + rng.random()))
-        yc = (base - amp * crest) * h
-        slope = np.gradient(yc) / (amp * h * freq / w * 2 * np.pi)
-        # Faces that drop away to the right look at the sun; they catch it
-        # along the crest and fall into shade below.
-        lit = smoothstep(-0.2, 0.7, slope)[None, :]
-        below = yy - yc[None, :]
-        top = mix(col(dark_c), col(lit_c), (0.15 + 0.70 * lit)[..., None])
-        color = mix(top, col(dark_c) * 0.85, smoothstep(0, amp * h * 0.9, below)[..., None])
-        rim = np.exp(-np.clip(below, 0, None) / (3.0 * h / 2160)) * (0.15 + 0.6 * lit)
-        color += (rim * (1 - haze))[..., None] * glow * 0.45
-        color = mix(color, haze_color, haze)
-        paint(arr, np.clip(below + 0.5, 0, 1), color)
-    return finish(vignette(arr, 0.32), seed)
-
-
-# --- lake --------------------------------------------------------------------
-
-def pine(draw, x, base, height, ss):
-    """A pine silhouette: a trunk and stacked, slightly ragged tiers."""
-    tiers = 7
-    width = height * 0.30
-    draw.rectangle([x - height * 0.012, base - height * 0.12, x + height * 0.012, base], fill=255)
-    for i in range(tiers):
-        t = i / tiers
-        top = base - height * (0.10 + 0.90 * (i + 1) / tiers) - height * 0.06
-        bottom = base - height * (0.08 + 0.80 * t)
-        half = width * (1 - t * 0.82) / 2
-        draw.polygon([(x - half, bottom), (x, top), (x + half, bottom)], fill=255)
-
-
-def render_lake(w, h, seed):
-    rng = np.random.default_rng(seed)
-    s = h / 2160
-    xx, yy = coords(w, h)
-    hz = int(0.58 * h)
-    arr = gradient(w, h, [(0, "#0c0c10"), (0.40, "#16141c"), (0.58, "#2a2531"), (1, "#2a2531")]).copy()
-    mx, my = 0.67 * w, 0.21 * h
-    add_glow(arr, xx, yy, mx, my, 0.32 * h, C["magenta"], 0.11)
-    add_glow(arr, xx, yy, mx, my, 0.07 * h, "#efe9fb", 0.16)
-    add_stars(arr, rng, int(520 * w * h / 8.3e6), 0.0, 0.50, s=s)
-
-    # Ranges behind the lake: sharp peaks, moonlight along the faces that
-    # turn toward the moon, the far ones paler in the haze.
-    layers = [(0.26, 0.58, 0, "#3a3545", 0.50, 1.7), (0.18, 0.55, 1, "#282530", 0.25, 1.4),
-              (0.10, 0.50, 2, "#17151c", 0.0, 1.2)]
-    mist = col("#3a3442")
-    moonlit = col("#a59bbf")
-    for height, rough, smooth, color, haze, sharp in layers:
-        prof = ((ridge(w, rng, rough, smooth) + 1) / 2) ** sharp
-        yc = hz - height * h * (0.12 + 0.88 * prof)
-        # Light follows the broad shape of the range, not every jag in it.
-        k = max(6, int(110 * s))
-        kernel = np.exp(-np.linspace(-2.5, 2.5, 2 * k + 1) ** 2)
-        kernel /= kernel.sum()
-        smooth_yc = np.convolve(np.pad(yc, k, mode="edge"), kernel, mode="valid")
-        slope = np.gradient(smooth_yc) / (height * h / w * 25)
-        # A face dropping away to the right looks right, toward the moon.
-        lit = (smoothstep(0.0, 0.8, slope) if mx > w / 2 else smoothstep(0.0, 0.8, -slope))[None, :]
-        below = yy - yc[None, :]
-        below_smooth = np.clip(yy - smooth_yc[None, :], 0, None)
-        rim = np.exp(-np.clip(below, 0, None) / (10 * s)) * lit * 0.55
-        face = col(color) + (lit * np.exp(-below_smooth / (0.08 * h)) * 0.10)[..., None] * moonlit
-        layer = face + rim[..., None] * moonlit * 0.6
-        layer = mix(layer, mist, haze)
-        cover = np.clip(below + 0.5, 0, 1) * (yy < hz)
-        paint(arr, cover, layer)
-    # Mist lying on the far shore.
-    fog = np.exp(-((yy - hz) / (0.018 * h)) ** 2) * 0.55
-    paint(arr, fog, mist)
-
-    # The water mirrors everything above (the moon's own disc only shows as
-    # glints), darker, broken into ripples.
-    above = arr[:hz].copy()
-    r = 0.032 * h
-    moon = smoothstep(r + 1, r - 1, np.hypot(xx - mx, yy - my))
-    mottle = noise(w, h, rng, 0.012 * h, 3)
-    paint(arr, moon, col("#ece6f6")[None, None, :] * (0.88 + 0.12 * mottle)[..., None])
-    rows = np.arange(hz, h)
-    depth = (rows - hz) / (h - hz)
-    src = np.clip(2 * hz - rows - 1, 0, hz - 1)
-    ripple = (np.sin(rows * 0.9 * (1 + depth * 0.4)) + 0.6 * np.sin(rows * 2.3 + 1.1)) * (2 + 26 * depth) * s
-    cols_ = np.clip((np.arange(w)[None, :] + ripple[:, None]).astype(int), 0, w - 1)
-    water = above[src[:, None], cols_] * (0.50 - 0.18 * depth)[:, None, None] + col("#101016") * 0.45
-    streaks = noise(w, h - hz, rng, 0.004 * h, 2)
-    water *= (0.92 + 0.16 * streaks)[..., None]
-    # The moon's path: short horizontal glints in a column that widens toward you.
-    width = (8 + 0.16 * (rows - hz)) * s
-    glints = np.exp(-((np.arange(w)[None, :] - mx) / width[:, None]) ** 2)
-    xs = np.arange(w, dtype=np.float32)[None, :]
-    freq = rng.uniform(0.02, 0.06, len(rows))[:, None] / s
-    dash = smoothstep(0.55, 0.95, np.sin(xs * freq + rng.uniform(0, 2 * np.pi, len(rows))[:, None]))
-    row_bright = (rng.random(len(rows)) ** 2.5)[:, None] * (rows % max(1, round(3 * s)) == 0)[:, None]
-    water += (glints * dash * row_bright * (1.0 - 0.5 * depth)[:, None])[..., None] * col("#ece6f6") * 1.1
-    arr[hz:] = water
-    arr[hz - 1:hz + 1] = mix(arr[hz - 1:hz + 1], mist, 0.5)
-
-    # Shores and pines in front, drawn 2x for clean edges.
-    ss = 2
-    mask = Image.new("L", (w * ss, h * ss), 0)
-    d = ImageDraw.Draw(mask)
-    for x0, x1, top, side in ((0, 0.34, 0.86, -1), (0.74, 1.0, 0.89, 1)):
-        pts = [(x0 * w * ss, h * ss), (x1 * w * ss, h * ss)]
-        for t in np.linspace(0, 1, 40):
-            xs = x0 + (x1 - x0) * (1 - t) if side < 0 else x0 + (x1 - x0) * t
-            edge = abs(t - (0 if side < 0 else 1))
-            pts.append((xs * w * ss, (top + 0.10 * (1 - t) ** 2 + 0.006 * math.sin(t * 17)) * h * ss))
-        d.polygon(pts, fill=255)
-    for x0, x1, base, tallest, n in ((0.03, 0.26, 0.88, 0.46, 9), (0.80, 0.97, 0.905, 0.34, 7)):
-        for _ in range(n):
-            px = rng.uniform(x0, x1)
-            tall = tallest * rng.uniform(0.45, 1.0) * (1 - 0.6 * abs(px - (x0 + x1) / 2) / (x1 - x0))
-            pine(d, px * w * ss, (base + rng.uniform(0, 0.02)) * h * ss, tall * h * ss, ss)
-    mask = np.asarray(mask.resize((w, h), Image.LANCZOS), np.float32) / 255
-    paint(arr, mask, col("#09090c"))
-    return finish(vignette(arr, 0.30), seed)
-
-
-# --- planet ------------------------------------------------------------------
-
-def sphere(arr, xx, yy, cx, cy, radius, light, surface, atmosphere=None, glow_width=0.0):
-    """A lit sphere: Lambert shading from `light`, a soft terminator, and an
-    atmosphere glowing around the lit limb."""
-    nx, ny = (xx - cx) / radius, (yy - cy) / radius
-    r2 = nx * nx + ny * ny
-    nz = np.sqrt(np.clip(1 - r2, 0, 1))
-    lx, ly, lz = light
-    lam = nx * lx + ny * ly + nz * lz
-    lit = smoothstep(-0.08, 0.55, lam)
-    r = np.sqrt(r2)
-    if atmosphere is not None:
-        outside = np.clip(r - 1, 0, None) * radius
-        side = np.clip((nx * lx + ny * ly) / (r + 1e-6) * 0.7 + 0.45, 0, 1)
-        halo = np.exp(-outside / glow_width) * side * (r >= 1)
-        arr += halo[..., None] * col(atmosphere) * 0.55
-    body = surface * (0.04 + 0.96 * lit)[..., None]
-    if atmosphere is not None:
-        rim = (1 - nz) ** 3 * smoothstep(-0.2, 0.6, lam)
-        body = body + rim[..., None] * col(atmosphere) * 0.85
-    edge = smoothstep(1 + 1.2 / radius, 1 - 1.2 / radius, r)
-    paint(arr, edge, body)
-
-
-def render_planet(w, h, seed):
-    rng = np.random.default_rng(seed)
-    s = h / 2160
-    xx, yy = coords(w, h)
-    arr = gradient(w, h, [(0, "#0b0b0f"), (1, "#111017")]).copy()
-    neb = noise(w, h, rng, 0.45 * h, 5) * noise(w, h, rng, 0.25 * h, 4)
-    arr += (smoothstep(0.25, 0.75, neb) * 0.10)[..., None] * mix(col(C["magenta"]), col(C["blue"]), 0.4)
-    add_stars(arr, rng, int(700 * w * h / 8.3e6), 0.0, 1.0, s=s)
-    light = np.array([-0.82, -0.38, 0.30], np.float32)
-    light /= np.linalg.norm(light)
-    cx, cy, radius = 0.86 * w, 1.06 * h, 0.60 * h
-    # Gas-giant bands: latitude stripes, gently warped by low noise.
-    turb = noise(w, h, rng, 0.18 * h, 3)
-    fine = noise(w, h, rng, 0.03 * h, 2)
-    lat = (yy - cy) / radius
-    band = 0.5 + 0.5 * np.sin(lat * 24 + turb * 1.6 + fine * 0.35)
-    band2 = 0.5 + 0.5 * np.sin(lat * 9 + turb * 0.8 + 1.3)
-    surface = mix(col("#2b2736"), col("#5d5270"), (band * 0.7)[..., None])
-    surface = mix(surface, col("#41506a"), (band2 * 0.45)[..., None])
-    sphere(arr, xx, yy, cx, cy, radius, light, surface, atmosphere="#8fb4ff", glow_width=0.05 * h)
-    moon_surface = mix(col("#4b4954"), col("#77737f"), noise(w, h, rng, 0.01 * h, 3)[..., None])
-    sphere(arr, xx, yy, 0.24 * w, 0.30 * h, 0.042 * h, light, moon_surface)
-    return finish(vignette(arr, 0.25), seed)
-
-
-# --- flow --------------------------------------------------------------------
-
-def render_flow(w, h, seed):
-    """Hairlines traced through a smooth flow field, thousands of them, each
-    tinted by where it started."""
-    rng = np.random.default_rng(seed)
-    s = h / 2160
-    xx, yy = coords(w, h)
-    arr = gradient(w, h, [(0, "#131217"), (1, "#0f0f12")]).copy()
-    add_glow(arr, xx, yy, 0.5 * w, 0.5 * h, 0.5 * h, C["magenta"], 0.05)
-    q = 4
-    # Curl noise: the flow runs along the contours of a smooth potential, so
-    # lines swirl side by side instead of piling into a few veins.
-    # A steady drift to the right turns the eddies into long streaming threads.
-    psi = noise(w // q, h // q, rng, 700 / q * s, 3, 0.45)
-    gy, gx = np.gradient(psi)
-    m = np.hypot(gx, gy).mean() + 1e-9
-    field = np.arctan2(-gx / m, gy / m + 1.1)
-    n, steps, step = int(6500 * w * h / 8.3e6), 700, 1.4 * s
-    # Start some threads off the left edge so they drift in and fill it.
-    px, py = rng.uniform(-0.35 * w, w, n), rng.uniform(0, h, n)
-    palette = [col(C["cyan"]), col(C["blue"]), col(C["magenta"]), col(C["red"])]
-    t = np.clip(px / w + rng.normal(0, 0.08, n), 0, 0.999) * (len(palette) - 1)
-    i0 = t.astype(int)
-    colors = np.stack([palette[i] for i in i0]) * (1 - (t - i0))[:, None] + np.stack([palette[i + 1] for i in i0]) * (t - i0)[:, None]
-    dens = np.zeros(h * w, np.float32)
-    acc = np.zeros((h * w, 3), np.float32)
-    for k in range(steps):
-        a = field[np.clip((py / q).astype(int), 0, h // q - 1), np.clip((px / q).astype(int), 0, w // q - 1)]
-        px += np.cos(a) * step
-        py += np.sin(a) * step
-        on = (px >= 0) & (px < w) & (py >= 0) & (py < h)
-        idx = (py[on].astype(int) * w + px[on].astype(int))
-        weight = math.sin(math.pi * (k + 0.5) / steps) * 0.11
-        np.add.at(dens, idx, weight)
-        np.add.at(acc, idx, colors[on] * weight)
-    dens = dens.reshape(h, w)
-    tint = acc.reshape(h, w, 3) / np.maximum(dens, 1e-6)[..., None]
-    alpha = 1 - np.exp(-dens * 1.6)
-    lines = tint * (0.85 * alpha)[..., None]
-    halo = np.asarray(Image.fromarray(np.clip(lines, 0, 255).astype(np.uint8)).filter(ImageFilter.GaussianBlur(6 * s)), np.float32)
-    arr = arr * (1 - alpha[..., None] * 0.9) + lines + halo * 0.35
-    return finish(vignette(arr, 0.35), seed)
+def scatter(w, h, r, rng, accept=None, attempts=None):
+    """Random points at least r apart (dart throwing on a grid), only where
+    accept(x, y) agrees."""
+    cell = r / math.sqrt(2)
+    gw, gh = int(w / cell) + 1, int(h / cell) + 1
+    grid = -np.ones((gh, gw), np.int64)
+    pts = []
+    attempts = attempts or int(3 * w * h / (r * r))
+    for x, y in zip(rng.uniform(0, w, attempts), rng.uniform(0, h, attempts)):
+        if accept is not None and not accept(x, y):
+            continue
+        gx, gy = int(x / cell), int(y / cell)
+        near = grid[max(0, gy - 2):gy + 3, max(0, gx - 2):gx + 3]
+        if any((pts[k][0] - x) ** 2 + (pts[k][1] - y) ** 2 < r * r for k in near[near >= 0]):
+            continue
+        grid[gy, gx] = len(pts)
+        pts.append((x, y))
+    return pts
 
 
 # --- topography --------------------------------------------------------------
@@ -576,243 +295,627 @@ def render_topography(w, h, seed):
     height = noise(w, h, rng, 0.55 * h, 5, 0.48)
     for cx, cy, sg, amp in ((0.62, 0.40, 0.16, 0.45), (0.30, 0.66, 0.12, 0.25)):
         height += amp * np.exp(-(((xx / w - cx) * w / h) ** 2 + (yy / h - cy) ** 2) / (2 * sg * sg))
-    height = (height - height.min()) / (height.max() - height.min())
-    gy, gx = np.gradient(height)
-    shade = np.clip((-gx * 0.7 - gy * 0.7) * 900, -1, 1)
-    arr = np.zeros((h, w, 3), np.float32) + col("#1b1b1d")
-    arr += (shade * 5)[..., None]
+    height = normalize(height)
+    arr = ground(w, h)
+    relief(arr, height)
     levels = 34
-    v = height * levels
-    grad = np.hypot(gx, gy) * levels + 1e-6
-    level = np.round(v)
-    dist = np.abs(v - level) / grad                      # pixels to the nearest contour
-    index = (level % 5 == 0)
-    width = np.where(index, 1.5, 0.9) * s
-    line = np.clip(width + 0.5 - dist, 0, 1)
-    color = np.where(index[..., None], col("#4c4c50"), col("#343437"))
-    special = level == int(levels * 0.62)
-    color = np.where(special[..., None], col(C["magenta"]), color)
-    paint(arr, line * np.where(special, 1.0, 0.95), color)
+    contour_lines(arr, height, levels, s, accent=LAVENDER, accent_level=int(levels * 0.62))
     # Mark the summit.
     sy, sx = np.unravel_index(np.argmax(height), height.shape)
     img = finish(vignette(arr, 0.25), seed, grain=1.0)
     d = ImageDraw.Draw(img)
     font = ImageFont.truetype(FONT, round(26 * s))
     r = 7 * s
-    d.polygon([(sx, sy - r), (sx - r, sy + r * 0.8), (sx + r, sy + r * 0.8)], fill=C["foreground"])
-    d.text((sx + 16 * s, sy - 13 * s), "2184", font=font, fill=C["light_foreground"])
+    d.polygon([(sx, sy - r), (sx - r, sy + r * 0.8), (sx + r, sy + r * 0.8)], fill=MARK)
+    d.text((sx + 16 * s, sy - 13 * s), "2184", font=font, fill=LABEL)
     return img
 
 
-# --- windows -----------------------------------------------------------------
+# --- ridgelines --------------------------------------------------------------
 
-TS_KEYWORDS = {"export", "function", "return", "const", "let", "type", "extends", "if", "throw", "new",
-               "import", "from"}
-TS_TYPES = {"number", "string", "boolean", "void"}
-STRING = C["yellow"]  # string.quoted
-
-HERO_CODE = """// min.ts: less, but better.
-type Comparable = number | string;
-
-export function min<T extends Comparable>(...values: T[]): T {
-  if (values.length === 0) throw new RangeError("min() needs a value");
-  return values.reduce((a, b) => (a < b ? a : b));
-}
-
-export const clamp = (v: number, lo: number, hi: number) =>
-  Math.max(lo, Math.min(v, hi));
-
-console.log(min(3, 1, 2)); // 1""".split("\n")
-HERO_PARAMS = {"values", "a", "b", "v", "lo", "hi"}
-
-
-def ts_tokens(line, params=HERO_PARAMS):
-    """Split a line of TypeScript into (text, color) runs, Min Dark style."""
-    out, i = [], 0
-    while i < len(line):
-        ch = line[i]
-        if line.startswith("//", i):
-            out.append((line[i:], COMMENT))
-            break
-        if ch in "\"'`":
-            j = line.find(ch, i + 1)
-            j = len(line) if j < 0 else j + 1
-            out.append((line[i:j], STRING))
-            i = j
-            continue
-        if ch.isdigit():
-            j = i
-            while j < len(line) and (line[j].isalnum() or line[j] == "."):
-                j += 1
-            out.append((line[i:j], NUMBER))
-            i = j
-            continue
-        if ch.isalpha() or ch in "_$":
-            j = i
-            while j < len(line) and (line[j].isalnum() or line[j] in "_$"):
-                j += 1
-            word, rest = line[i:j], line[j:].lstrip()
-            if word in TS_KEYWORDS:
-                color = KEYWORD
-            elif word in TS_TYPES or rest.startswith("."):
-                color = CONSTANT
-            elif rest.startswith("(") or rest.startswith("<"):
-                color = FUNCTION
-            elif word in params:
-                color = PARAMETER
-            else:
-                color = FUNCTION if word[0].isupper() else DEFAULT
-            out.append((word, color))
-            i = j
-            continue
-        for op in ("===", "=>", "...", "<=", ">=", "&&", "||"):
-            if line.startswith(op, i):
-                out.append((op, KEYWORD))
-                i += len(op)
-                break
-        else:
-            out.append((ch, KEYWORD if ch in "=<>?:|+-*/!&" else (DEFAULT if ch == " " else PUNCTUATION)))
-            i += 1
-    return out
-
-
-def window(img, x0, y0, body, radius, s, active):
-    """Composite a window body onto img at (x0, y0): squircle corners, two
-    shadows, a hairline, and traffic lights (gray when inactive)."""
-    w, h = img.size
-    ww, wh = body.size
-    mask = squircle_mask(ww, wh, radius)
-    for blur, dy, alpha in ((60 * s, 30 * s, 0.55), (10 * s, 5 * s, 0.35)):
-        layer = Image.new("L", (w, h), 0)
-        layer.paste(mask, (x0, round(y0 + dy)))
-        layer = layer.filter(ImageFilter.GaussianBlur(blur)).point(lambda v: v * alpha)
-        img.paste(Image.new("RGB", (w, h), (0, 0, 0)), (0, 0), layer)
-    img.paste(body, (x0, y0), mask)
-    from PIL import ImageChops
-    edge = ImageChops.subtract(mask, mask.filter(ImageFilter.MinFilter(5)))
-    img.paste(Image.new("RGB", (ww, wh), (255, 255, 255)), (x0, y0), edge.point(lambda v: v * 0.11))
-    ss = 4
-    bar_h = round(56 * s)
-    dots = Image.new("RGBA", (round(130 * s) * ss, bar_h * ss), (0, 0, 0, 0))
-    d = ImageDraw.Draw(dots)
-    size, gap, cx = 22 * s * ss, 14 * s * ss, 24 * s * ss
-    for color in (("#ff5f57", "#febc2e", "#28c840") if active else ("#4a4a4c",) * 3):
-        d.ellipse([cx, bar_h * ss / 2 - size / 2, cx + size, bar_h * ss / 2 + size / 2], fill=color)
-        cx += size + gap
-    dots = dots.resize((dots.width // ss, bar_h), Image.LANCZOS)
-    img.paste(dots, (x0, y0), dots)
-
-
-def render_window(w, h, seed):
+def render_ridgelines(w, h, seed):
+    """Elevation profiles of a range, one behind the other, each hiding what's
+    behind it; the far ones dimmer. One profile in pink, its peak marked."""
+    rng = np.random.default_rng(seed + 1)
     s = h / 2160
-    img = Image.fromarray(np.clip(silk(w, h, seed, SILK) * 0.72, 0, 255).astype(np.uint8))
-    mono = ImageFont.truetype(FONT, round(28 * s))
-    small = ImageFont.truetype(FONT, round(22 * s))
-    ui = ImageFont.truetype(UI_FONT, round(23 * s))
-    cell = mono.getlength("M")
-    asc, desc = mono.getmetrics()
+    rows, top, bottom = 64, 0.27 * h, 0.86 * h
+    gap = (bottom - top) / (rows - 1)
+    step = 3 * s
+    xs = np.arange(-4 * step, w + 4 * step, step)
+    # One terrain, sliced: neighbouring profiles share their mountains.
+    terrain = noise(len(xs), rows * 4, rng, 0.11 * len(xs), 6, 0.5)
+    envelope = 0.18 + 0.82 * np.exp(-((xs / w - 0.5) / 0.26) ** 2)
+    pink = int(rows * 0.58)
+    plate = Plate(ground(w, h))
+    peak = None
+    for i in range(rows):
+        n = terrain[i * 4]
+        ridged = 1 - np.abs(2 * n - 1)
+        lift = (0.65 * ridged ** 2.2 + 0.35 * n) * envelope * gap * 13
+        ys = top + i * gap - lift
+        pts = list(zip(xs, ys))
+        plate.polygon(pts + [(xs[-1], h + 10), (xs[0], h + 10)], GROUND)
+        if i == pink:
+            plate.line(pts, PINK, 1.4 * s)
+            k = int(np.argmin(np.where(np.abs(xs - w / 2) < 0.4 * w, ys, np.inf)))
+            peak = (xs[k], ys[k])
+        else:
+            plate.line(pts, hexmix("#2d2d30", "#56565a", (i / (rows - 1)) ** 0.8), 1.15 * s)
+    px, py = peak
+    plate.summit(px, py - 20 * s, s)
+    plate.label(px + 16 * s, py - 13 * s, "1450", s)
+    return plate.finish(seed)
 
-    # The editor: activity bar, explorer, a tab, the code, a status bar.
-    ew, eh = round(0.58 * w), round(0.60 * h)
-    body = Image.new("RGB", (ew, eh), C["background"])
-    d = ImageDraw.Draw(body)
-    bar, tabs, status, act, side = round(56 * s), round(50 * s), round(34 * s), round(58 * s), round(330 * s)
-    d.rectangle([0, 0, ew, bar], fill=C["dark_background"])
-    d.text((ew / 2, bar / 2), "min.ts — min-dark", font=ui, fill=C["muted"], anchor="mm")
-    d.rectangle([0, bar, act + side, eh], fill=C["dark_background"])
-    for i, glyph in enumerate(("", "", "", "")):
-        d.text((act / 2, bar + 46 * s + i * 66 * s), glyph, font=ImageFont.truetype(FONT, round(30 * s)),
-               fill=C["foreground"] if i == 0 else "#5c5c5c", anchor="mm")
-    d.line([(act, bar), (act, eh)], fill="#232323", width=max(1, round(s)))
-    d.text((act + 22 * s, bar + 24 * s), "EXPLORER", font=ImageFont.truetype(UI_FONT, round(19 * s)),
-           fill=C["muted"])
-    tree = [("v min-dark", 0, C["foreground"]), ("> backgrounds", 1, "#9e9e9e"), ("v tools", 1, "#9e9e9e"),
-            ("make-wallpaper.py", 2, "#9e9e9e"), ("colors.toml", 1, "#9e9e9e"), ("min.ts", 1, "#f5f5f5"),
-            ("README.md", 1, "#9e9e9e")]
-    chevron = ImageFont.truetype(FONT, round(20 * s))
-    for i, (name, depth, color) in enumerate(tree):
-        y = bar + 70 * s + i * 40 * s
-        if name == "min.ts":
-            d.rectangle([act, y - 6 * s, act + side, y + 32 * s], fill="#262626")
-        x = act + (24 + depth * 20) * s
-        if name[:2] in ("v ", "> "):
-            d.text((x, y + 15 * s), "▾" if name[0] == "v" else "▸", font=chevron, fill="#7d7d7d", anchor="lm")
-            name = name[2:]
-        d.text((x + 20 * s, y), name, font=ui, fill=color)
-    ex = act + side
-    d.rectangle([ex, bar, ew, bar + tabs], fill=C["dark_background"])
-    d.rectangle([ex, bar, ex + 170 * s, bar + tabs], fill=C["background"])
-    d.text((ex + 85 * s, bar + tabs / 2), "min.ts", font=ui, fill="#fafafa", anchor="mm")
-    d.text((ex + 250 * s, bar + tabs / 2), "colors.toml", font=ui, fill=C["muted"], anchor="mm")
-    line_h = round(28 * s * 1.75)
-    top = bar + tabs + 26 * s
-    active = 11
-    gutter = ex + 36 * s
-    code_x = gutter + 4 * cell + 2.5 * cell
-    lt = top + active * line_h
-    d.rectangle([ex, lt, ew, lt + line_h - 1], outline=LINE_BORDER, width=max(1, round(2 * s)))
-    for i, src in enumerate(HERO_CODE):
-        y = top + i * line_h + (line_h - asc - desc) / 2
-        num = str(i + 1)
-        d.text((gutter + (4 - len(num)) * cell, y), num, font=mono, fill=LINE_NUMBER_ACTIVE if i == active else LINE_NUMBER)
-        if 4 <= i <= 5 or i == 9:
-            gx = round(code_x)
-            d.line([(gx, top + i * line_h), (gx, top + (i + 1) * line_h - 1)], fill=INDENT_GUIDE, width=max(1, round(s)))
-        x = code_x
-        for text, color in ts_tokens(src):
-            d.text((x, y), text, font=mono, fill=color)
-            x += len(text) * cell
-        if i == active:
-            d.rectangle([x + 2, lt + line_h * 0.2, x + 2 + 3 * s, lt + line_h * 0.8], fill=CURSOR)
-    d.rectangle([0, eh - status, ew, eh], fill=C["dark_background"])
-    d.text((act + 18 * s, eh - status / 2), " main", font=small, fill="#7e7e7e", anchor="lm")
-    d.text((ew - 24 * s, eh - status / 2), "TypeScript   UTF-8   Ln 12, Col 30", font=small, fill="#7e7e7e", anchor="rm")
-    window(img, round(0.115 * w), round(0.13 * h), body, round(24 * s), s, active=False)
 
-    # The terminal, in front.
-    tw, th = round(0.34 * w), round(0.33 * h)
-    term = Image.new("RGB", (tw, th), C["background"])
-    d = ImageDraw.Draw(term)
-    d.rectangle([0, 0, tw, bar], fill=C["dark_background"])
-    d.text((tw / 2, bar / 2), "~/min-dark", font=ui, fill=C["muted"], anchor="mm")
-    lines = [
-        [("❯ ", C["magenta"]), ("bun test", C["foreground"])],
-        [("bun test v1.2", C["muted"])],
-        [],
-        [("min.test.ts:", C["foreground"])],
-        [("✓ ", C["green"]), ("min() picks the smallest value ", C["foreground"]), ("[0.09ms]", C["muted"])],
-        [("✓ ", C["green"]), ("min() throws on no values ", C["foreground"]), ("[0.02ms]", C["muted"])],
-        [],
-        [(" 2 pass", C["green"])],
-        [(" 0 fail", C["muted"])],
-        [("Ran 2 tests across 1 file. ", C["muted"]), ("[14.00ms]", C["muted"])],
-        [("❯ ", C["magenta"])],
-    ]
-    tline = round(26 * s * 1.6)
-    tfont = ImageFont.truetype(FONT, round(26 * s))
-    tcell = tfont.getlength("M")
-    for i, runs in enumerate(lines):
-        x, y = 30 * s, bar + 26 * s + i * tline
-        for text, color in runs:
-            d.text((x, y), text, font=tfont, fill=color)
-            x += len(text) * tcell
-        if i == len(lines) - 1:
-            d.rectangle([x, y + 2 * s, x + tcell, y + tline - 8 * s], fill=CURSOR)
-    window(img, round(0.535 * w), round(0.535 * h), term, round(24 * s), s, active=True)
-    return img
+# --- rivers ------------------------------------------------------------------
+
+def drainage(cost, mouth):
+    """Grow a river network back from its mouth: every cell drains along its
+    cheapest route there (Dijkstra over the cells, with knight's moves too so
+    streams aren't held to eight directions). Returns each cell's route cost,
+    the next cell downstream (-1 at the mouth), and the cells in the order
+    they were reached."""
+    h, w = cost.shape
+    c = cost.ravel().tolist()
+    dist, down, done, order = [math.inf] * (h * w), [-1] * (h * w), bytearray(h * w), []
+    moves = [(dy, dx, math.hypot(dy, dx)) for dy in range(-2, 3) for dx in range(-2, 3)
+             if (dy or dx) and math.gcd(dy, dx) == 1]
+    dist[mouth] = 0.0
+    heap = [(0.0, mouth)]
+    while heap:
+        di, i = heapq.heappop(heap)
+        if done[i]:
+            continue
+        done[i] = 1
+        order.append(i)
+        y, x = divmod(i, w)
+        ci = c[i]
+        for dy, dx, step in moves:
+            ny, nx = y + dy, x + dx
+            if 0 <= ny < h and 0 <= nx < w:
+                j = ny * w + nx
+                if not done[j]:
+                    dj = di + (ci + c[j]) * 0.5 * step
+                    if dj < dist[j]:
+                        dist[j], down[j] = dj, i
+                        heapq.heappush(heap, (dj, j))
+    return np.array(dist).reshape(h, w), down, order
+
+
+def render_rivers(w, h, seed):
+    """One river basin: every stream runs down the cheapest way to a single
+    mouth at the bottom edge, through the low ground of a noise field, and a
+    stream shows once enough cells drain into it. Width grows with the area
+    drained; the main river is blue."""
+    rng = np.random.default_rng(seed + 2)
+    s = h / 2160
+    q = 5                                                # terrain cell, px
+    gw, gh = w // q, h // q
+    cost = (0.05 + noise(gw, gh, rng, 0.3 * gh, 6, 0.55) ** 3 + 0.3 * noise(gw, gh, rng, 0.05 * gh, 3, 0.5) ** 2
+            + 0.08 * rng.random((gh, gw)))
+    mouth = (gh - 1) * gw + gw // 2
+    dist, down, order = drainage(cost, mouth)
+    acc = [1.0] * len(down)
+    for i in reversed(order):
+        if down[i] >= 0:
+            acc[down[i]] += acc[i]
+    acc = np.array(acc)
+
+    # The land rises with the cost of the way down; it only places the summit.
+    small = Image.fromarray(dist.astype(np.float32), "F").resize((gw // 8, gh // 8), Image.BOX)
+    height = np.asarray(small.resize((w, h), Image.BICUBIC), np.float32)
+    plate = Plate(ground(w, h))
+
+    threshold = 140
+    river = acc >= threshold
+    top = math.log(acc.max() / threshold)
+
+    def look(a):
+        t = np.log(np.maximum(a, threshold) / threshold) / top
+        return s * (0.7 + 3.6 * t ** 1.3), [hexmix("#3a3a3e", "#66666b", round(v * 6) / 6) for v in t]
+
+    def point(i):
+        y, x = divmod(i, gw)
+        return ((x + 0.5) * q, (y + 0.5) * q)
+
+    def draw(path, color=None):
+        pts = chaikin([point(i) for i in path], 3)
+        a = np.interp(np.linspace(0, len(path) - 1, len(pts)), np.arange(len(path)), acc[path])
+        widths, colors = look(a)
+        plate.stroke(pts, widths, [color] * len(pts) if color else colors)
+
+    # Trace every stream from its source down to where it joins another.
+    upstream = np.zeros(len(down), np.int64)
+    for i in np.flatnonzero(river):
+        if down[i] >= 0:
+            upstream[down[i]] += 1
+    seen = bytearray(len(down))
+    for src in np.flatnonzero(river & (upstream == 0)):
+        path, i = [src], src
+        seen[i] = 1
+        while down[i] >= 0:
+            i = down[i]
+            path.append(i)
+            if seen[i]:
+                break
+            seen[i] = 1
+        draw(path)
+
+    # The main river: from the mouth, always up the bigger branch.
+    ups = {}
+    for i in np.flatnonzero(river):
+        if down[i] >= 0:
+            ups.setdefault(down[i], []).append(i)
+    i, trunk = mouth, [mouth]
+    while i in ups:
+        i = max(ups[i], key=lambda k: acc[k])
+        trunk.append(i)
+    draw(trunk[::-1], BLUE)
+
+    xx, yy = coords(w, h)
+    inside = (np.abs(xx - w / 2) < 0.42 * w) & (yy > 0.1 * h) & (yy < 0.9 * h)
+    sy, sx = np.unravel_index(np.argmax(np.where(inside, height, 0)), height.shape)
+    plate.summit(sx, sy, s)
+    plate.label(sx + 16 * s, sy + 7 * s, "1630", s)
+    return plate.finish(seed)
+
+
+# --- globe -------------------------------------------------------------------
+
+def unit(lat, lon):
+    la, lo = np.radians(lat), np.radians(lon)
+    return np.stack([np.cos(la) * np.cos(lo), np.cos(la) * np.sin(lo), np.sin(la)], -1)
+
+
+def render_globe(w, h, seed):
+    """A wireframe globe: a 15° graticule, the land as a field of dots, and a
+    flight from Singapore to San Francisco flown along its great circle, a
+    little above the surface."""
+    s = h / 2160
+    cx, cy, radius = w / 2, h / 2, 0.40 * h
+    sin_city, sfo = unit(1.36, 103.99), unit(37.62, -122.38)
+    # Face the middle of the route.
+    # Look at the route from 22° south of its middle, so the great circle bends
+    # (seen face on through its middle it would be a straight line).
+    mid = (sin_city + sfo) / np.linalg.norm(sin_city + sfo)
+    lat0, lon0 = math.degrees(math.asin(mid[2])) - 22, math.degrees(math.atan2(mid[1], mid[0]))
+    view = unit(lat0, lon0)
+    east = np.array([-math.sin(math.radians(lon0)), math.cos(math.radians(lon0)), 0])
+    north = np.cross(view, east)
+
+    def project(p):
+        """3-D points -> screen x, y and depth (> 0 faces us)."""
+        return cx + radius * (p @ east), cy - radius * (p @ north), p @ view
+
+    plate = Plate(ground(w, h))
+
+    def curve(lat, lon, color, width):
+        x, y, z = project(unit(lat, lon))
+        run = []
+        for px, py, pz in zip(x, y, z):
+            if pz > 0:
+                run.append((px, py))
+            elif run:
+                plate.line(run, color, width)
+                run = []
+        plate.line(run, color, width)
+
+    fine = np.arange(-180, 180.5, 0.5)
+    for lat in range(-75, 90, 15):
+        curve(np.full_like(fine, lat), fine, MAJOR if lat == 0 else MINOR, (1.3 if lat == 0 else 0.9) * s)
+    meridian = np.arange(-90, 90.5, 0.5)
+    for lon in range(-180, 180, 15):
+        curve(meridian, np.full_like(meridian, lon), MINOR, 0.9 * s)
+
+    # Land: dots evenly spread over the sphere, kept where the map says land.
+    land = np.asarray(Image.open(LAND))
+    step = 0.85
+    for lat in np.arange(-85, 85, step):
+        lon = np.arange(-180, 180, step / max(0.05, math.cos(math.radians(lat))))
+        row = int((90 - lat) / 180 * land.shape[0])
+        on = land[row, ((lon + 180) / 360 * land.shape[1]).astype(int) % land.shape[1]]
+        x, y, z = project(unit(np.full(on.sum(), lat), lon[on]))
+        for px, py, pz in zip(x, y, z):
+            if pz > 0.02:
+                plate.circle(px, py, (0.9 + 1.4 * pz ** 0.5) * s, hexmix("#38383b", "#5c5c60", pz ** 0.6))
+
+    plate.circle(cx, cy, radius, outline=MAJOR, width=1.5 * s)
+
+    # The flight, on its great circle: its ground track dashed, the flight
+    # itself raised off the surface at mid-route.
+    angle = math.acos(float(sin_city @ sfo))
+    t = np.linspace(0, 1, 400)
+    path = (np.sin((1 - t) * angle)[:, None] * sin_city + np.sin(t * angle)[:, None] * sfo) / math.sin(angle)
+    gx, gy, _ = project(path)
+    plate.dashed(list(zip(gx, gy)), MAJOR, 1.1 * s, 10 * s, 9 * s)
+    ax, ay, _ = project(path * (1 + 0.11 * np.sin(np.pi * t))[:, None])
+    plate.line(list(zip(ax, ay)), ORANGE, 1.8 * s)
+    for (px, py), name, side in (((gx[0], gy[0]), "SIN", -1), ((gx[-1], gy[-1]), "SFO", 1)):
+        plate.circle(px, py, 7 * s, outline=ORANGE, width=1.6 * s)
+        plate.circle(px, py, 2.4 * s, MARK)
+        plate.label(px + side * 16 * s, py + 30 * s, name, s, anchor="ls" if side > 0 else "rs")
+    k = len(t) // 2
+    nx, ny = ay[k + 1] - ay[k - 1], ax[k - 1] - ax[k + 1]
+    if ny > 0:
+        nx, ny = -nx, -ny
+    norm = math.hypot(nx, ny)
+    plate.label(ax[k] + nx / norm * 44 * s, ay[k] + ny / norm * 44 * s, "13 590 km", s, anchor="mm")
+    return plate.finish(seed)
+
+
+# --- circuit -----------------------------------------------------------------
+
+def render_circuit(w, h, seed):
+    """A circuit board: three chips, small two-pad parts, and traces fanning
+    out of the chips' pins at 0, 45 and 90 degrees to end in vias. The
+    longest trace in green."""
+    rng = np.random.default_rng(seed + 4)
+    s = h / 2160
+    g = 26 * s                                           # routing grid, px
+    cols, rows = int(w / g), int(h / g)
+    free = np.ones((rows, cols), bool)
+    margin = 3
+    free[:margin], free[-margin:], free[:, :margin], free[:, -margin:] = False, False, False, False
+
+    def at(c, r):
+        return ((c + 0.5) * g, (r + 0.5) * g)
+
+    plate = Plate(ground(w, h))
+    chips = [("U1", 0.30, 0.38, 20, 20), ("U2", 0.64, 0.30, 14, 8), ("U3", 0.60, 0.66, 9, 9)]
+    pins = []
+    for name, fx, fy, cw, ch in chips:
+        c0, r0 = int(cols * fx - cw / 2), int(rows * fy - ch / 2)
+        free[r0 - 1:r0 + ch + 1, c0 - 1:c0 + cw + 1] = False
+        x0, y0 = c0 * g, r0 * g
+        x1, y1 = (c0 + cw) * g, (r0 + ch) * g
+        plate.rect(x0, y0, x1, y1, outline=MAJOR, width=1.6 * s)
+        plate.circle(x0 + 1.2 * g, y0 + 1.2 * g, 0.3 * g, outline=MAJOR, width=1.2 * s)
+        plate.label((x0 + x1) / 2, (y0 + y1) / 2 + 9 * s, name, s, anchor="ms")
+        sides = [(range(c0 + 1, c0 + cw - 1), lambda c: (c, r0 - 1), (0, -1)),
+                 (range(c0 + 1, c0 + cw - 1), lambda c: (c, r0 + ch), (0, 1)),
+                 (range(r0 + 1, r0 + ch - 1), lambda r: (c0 - 1, r), (-1, 0)),
+                 (range(r0 + 1, r0 + ch - 1), lambda r: (c0 + cw, r), (1, 0))]
+        for span, cell, out in sides:
+            for k in span:
+                c, r = cell(k)
+                px, py = at(c, r)
+                plate.rect(px - 0.22 * g, py - 0.22 * g, px + 0.22 * g, py + 0.22 * g, fill=MAJOR)
+                if rng.random() < 0.8:
+                    pins.append((c, r, out))
+
+    # Small two-pad parts dotted over the board, placed before the traces so
+    # they route around them.
+    for _ in range(40):
+        c, r = int(rng.integers(margin + 2, cols - margin - 4)), int(rng.integers(margin + 2, rows - margin - 4))
+        across = rng.random() < 0.5
+        cw, ch = (3, 1) if across else (1, 3)
+        if not free[r - 1:r + ch + 1, c - 1:c + cw + 1].all():
+            continue
+        free[r - 1:r + ch + 1, c - 1:c + cw + 1] = False
+        (ax, ay), (bx, by) = at(c, r), at(c + cw - 1, r + ch - 1)
+        plate.rect(ax - 0.4 * g, ay - 0.4 * g, bx + 0.4 * g, by + 0.4 * g, outline=MINOR, width=1.0 * s)
+        for px, py in ((ax, ay), (bx, by)):
+            plate.rect(px - 0.28 * g, py - 0.28 * g, px + 0.28 * g, py + 0.28 * g, fill=MAJOR)
+
+    directions = [(1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1), (0, -1), (1, -1)]
+    taken = {}
+
+    def can(c, r, dc, dr):
+        nc, nr = c + dc, r + dr
+        if not (0 <= nr < rows and 0 <= nc < cols and free[nr, nc]):
+            return False
+        # Don't cross another trace's diagonal.
+        return not (dc and dr and taken.get((c + dc, r)) is not None and taken.get((c + dc, r)) == taken.get((c, r + dr)))
+
+    traces = []
+    rng.shuffle(pins)
+    for n, (c, r, out) in enumerate(pins):          # pin cells are kept from other traces
+        taken[(c, r)] = n
+        heading = directions.index(out)
+        path = [(c, r)]
+        straight = int(rng.integers(1, 4))
+        for step in range(int(rng.integers(10, 80))):
+            options = [heading] if step < straight else [heading, (heading + 1) % 8, (heading - 1) % 8]
+            if step >= straight and rng.random() < 0.1:
+                options = options[1:] + options[:1]
+            for hd in options:
+                dc, dr = directions[hd]
+                if can(c, r, dc, dr) and abs(((hd - directions.index(out)) + 4) % 8 - 4) <= 2:
+                    heading = hd
+                    c, r = c + dc, r + dr
+                    free[r, c] = False
+                    taken[(c, r)] = n
+                    path.append((c, r))
+                    break
+            else:
+                break
+        if len(path) > 3:
+            traces.append(path)
+
+    longest = max(traces, key=len)
+    for path in traces:
+        accent = path is longest
+        color = GREEN if accent else "#3e3e42"
+        pts = [at(c, r) for c, r in path]
+        plate.line(pts, color, 2.2 * s)
+        ex, ey = pts[-1]
+        plate.circle(ex, ey, 0.34 * g, GROUND, outline=color, width=1.6 * s)
+    for fx, fy in ((0.12, 0.14), (0.88, 0.86)):
+        plate.circle(w * fx, h * fy, 1.3 * g, outline=MAJOR, width=1.4 * s)
+        plate.circle(w * fx, h * fy, 0.8 * g, outline=MINOR, width=1.0 * s)
+    return plate.finish(seed)
+
+
+# --- lunar -------------------------------------------------------------------
+
+def render_lunar(w, h, seed):
+    """A crater field as a contour map: each crater a bowl inside a raised
+    rim, larger ones deeper, over gently rolling ground. One contour round a
+    big crater's inner wall in orange, its name and size beside it."""
+    rng = np.random.default_rng(seed + 5)
+    s = h / 2160
+    xx, yy = coords(w, h)
+    height = 0.05 * noise(w, h, rng, 0.35 * h, 5, 0.5)
+    marked = (0.61 * w, 0.43 * h, 0.16 * h)
+    craters = [(0.30 * w, 0.64 * h, 0.11 * h), (0.83 * w, 0.76 * h, 0.075 * h), (0.18 * w, 0.24 * h, 0.06 * h)]
+    for _ in range(260):
+        r = min(0.05 * h, 9 * s * (1 - rng.random()) ** (-1 / 1.5))
+        craters.append((rng.uniform(-0.05, 1.05) * w, rng.uniform(-0.05, 1.05) * h, r))
+    craters.sort(key=lambda c: -c[2])                    # big and old first, small ones on top
+    craters.insert(0, marked)
+    for x, y, r in craters:
+        reach = 2.8 * r
+        x0, x1 = int(max(0, x - reach)), int(min(w, x + reach + 1))
+        y0, y1 = int(max(0, y - reach)), int(min(h, y + reach + 1))
+        if x0 >= x1 or y0 >= y1:
+            continue
+        d = np.hypot(xx[y0:y1, x0:x1] - x, yy[y0:y1, x0:x1] - y) / r
+        rim = 0.24 * np.exp(-((d - 1) / 0.14) ** 2)
+        profile = np.where(d < 1, 0.62 * (d * d - 1), 0.07 * np.exp(-(d - 1) * 2.4)) + rim
+        height[y0:y1, x0:x1] += (r / h) ** 0.8 * profile
+    height = normalize(height)
+    arr = ground(w, h)
+    relief(arr, height)
+    levels = 46
+    mx, my, mr = marked
+    theta = np.linspace(0, 2 * np.pi, 360, endpoint=False)
+    # A level the ground around the crater stays above, so it closes once,
+    # on the inner wall.
+    around = height[(my + 1.35 * mr * np.sin(theta)).astype(int), (mx + 1.35 * mr * np.cos(theta)).astype(int)]
+    near = np.hypot(xx - mx, yy - my) < 1.12 * mr
+    contour_lines(arr, height, levels, s, accent=ORANGE, accent_level=math.floor(around.min() * levels), where=near)
+    plate = Plate(arr)
+    plate.label(mx + 0.86 * mr, my - 0.9 * mr, "C-17  Ø 42 km", s, anchor="ls")
+    return plate.finish(seed)
+
+
+# --- nautical ----------------------------------------------------------------
+
+DEPTHS = [0, 2, 5, 10, 20, 30, 50, 100, 200]             # contours drawn, m
+
+
+def render_nautical(w, h, seed):
+    """A stretch of coast as a sea chart: land stippled, depth contours, the
+    soundings in metres scattered over the water, a compass rose. The 20 m
+    line in blue."""
+    rng = np.random.default_rng(seed + 6)
+    s = h / 2160
+    xx, yy = coords(w, h)
+    e = noise(w, h, rng, 0.5 * h, 6, 0.52) + 0.75 * (1 - (0.6 * xx / w + 0.4 * yy / h))  # land to the north-west
+    coast = np.quantile(e, 0.68)
+    sea = e < coast
+    depth = 200 * ((coast - e) / (coast - e.min())).clip(0) ** 1.7
+    # Contour index: whole numbers fall on the depths above; land below zero.
+    g = np.where(sea, np.interp(depth, DEPTHS, np.arange(len(DEPTHS))), (coast - e) / (e.max() - coast) * 3)
+    arr = ground(w, h)
+    contour_lines(arr, g, 1, s, every=len(DEPTHS) + 1, accent=BLUE, accent_level=DEPTHS.index(20),
+                  mask=(g > -0.5).astype(np.float32))
+    contour_lines(arr, np.where(sea, -1.0, 1.0) * np.minimum(np.abs(e - coast), 0.004) / 0.004 * 0.5, 1, s,
+                  every=1, mask=np.abs(e - coast) < 0.01)  # the coastline, stronger
+    plate = Plate(arr)
+
+    def wet(x, y):
+        return sea[int(y), int(x)]
+
+    for x, y in scatter(w, h, 13 * s, rng, lambda x, y: not wet(x, y)):
+        plate.circle(x, y, 1.6 * s, "#434346")
+
+    # The compass rose sits in deep water to the south-east.
+    window = (xx > 0.62 * w) & (xx < 0.82 * w) & (yy > 0.58 * h) & (yy < 0.78 * h)
+    ry, rx = np.unravel_index(np.argmax(np.where(window, depth, -1)), depth.shape)
+    rr = 170 * s
+    plate.circle(rx, ry, rr, outline=MAJOR, width=1.4 * s)
+    plate.circle(rx, ry, 0.86 * rr, outline=MINOR, width=1.0 * s)
+    for deg in range(0, 360, 2):
+        a = math.radians(deg)
+        inner = 0.86 if deg % 10 else 0.80
+        ux, uy = math.sin(a), -math.cos(a)
+        plate.line([(rx + ux * rr * inner, ry + uy * rr * inner), (rx + ux * rr, ry + uy * rr)],
+                   MAJOR if deg % 10 == 0 else MINOR, (1.2 if deg % 10 == 0 else 0.9) * s)
+        if deg % 30 == 0:
+            plate.label(rx + ux * rr * 0.68, ry + uy * rr * 0.68 + 7 * s, str(deg), s, size=18, anchor="ms")
+    plate.line([(rx, ry - 0.5 * rr), (rx, ry + 0.5 * rr)], MAJOR, 1.0 * s)
+    plate.line([(rx - 0.5 * rr, ry), (rx + 0.5 * rr, ry)], MAJOR, 1.0 * s)
+    plate.polygon([(rx, ry - 0.5 * rr), (rx - 9 * s, ry - 0.5 * rr + 26 * s), (rx + 9 * s, ry - 0.5 * rr + 26 * s)], MARK)
+
+    def open_water(x, y):
+        return wet(x, y) and depth[int(y), int(x)] > 1.5 and math.hypot(x - rx, y - ry) > 1.25 * rr
+
+    for x, y in scatter(w, h, 150 * s, rng, open_water):
+        plate.label(x, y, str(int(depth[int(y), int(x)])), s, color="#5e5e62", size=19, anchor="mm")
+    plate.label(0.06 * w, 0.93 * h, "DEPTHS IN METRES", s, size=20)
+    return plate.finish(seed)
+
+
+# --- stars -------------------------------------------------------------------
+
+def render_stars(w, h, seed):
+    """A star chart: right ascension and declination as curved lines, the
+    ecliptic dashed, stars sized by brightness, and six made-up
+    constellations joined the way chart makers do, the lines stopping short
+    of the stars. One constellation in lavender."""
+    rng = np.random.default_rng(seed + 7)
+    s = h / 2160
+    ra0, dec0 = math.radians(90), math.radians(20)
+    scale = (w / 2) / (2 * math.tan(math.radians(56) / 2))
+
+    def project(ra, dec):
+        """Stereographic, east to the left like the sky seen from below."""
+        ra, dec = np.radians(ra), np.radians(dec)
+        cos_c = math.sin(dec0) * np.sin(dec) + math.cos(dec0) * np.cos(dec) * np.cos(ra - ra0)
+        k = 2 / np.maximum(1 + cos_c, 1e-6)
+        x = k * np.cos(dec) * np.sin(ra - ra0)
+        y = k * (math.cos(dec0) * np.sin(dec) - math.sin(dec0) * np.cos(dec) * np.cos(ra - ra0))
+        return w / 2 - scale * x, h / 2 - scale * y, cos_c
+
+    plate = Plate(ground(w, h))
+    pad = 80 * s
+
+    def curve(ra, dec, color, width, dashed=False):
+        x, y, c = project(ra, dec)
+        keep = (c > 0) & (x > -pad) & (x < w + pad) & (y > -pad) & (y < h + pad)
+        runs, run = [], []
+        for px, py, k in zip(x, y, keep):
+            if k:
+                run.append((px, py))
+            elif run:
+                runs.append(run)
+                run = []
+        runs.append(run)
+        for run in runs:
+            if len(run) > 1:
+                if dashed:
+                    plate.dashed(run, color, width, 16 * s, 12 * s)
+                else:
+                    plate.line(run, color, width)
+        return x, y
+
+    fine = np.arange(0, 360.5, 0.5)
+    for dec in range(-30, 90, 10):
+        x, y = curve(fine, np.full_like(fine, dec), MAJOR if dec == 0 else "#2e2e31", (1.2 if dec == 0 else 0.9) * s)
+        near = np.flatnonzero((np.abs(x - 70 * s) < 6 * s) & (y > 0.08 * h) & (y < 0.92 * h))
+        if len(near):
+            plate.label(70 * s, y[near[0]] - 10 * s, f"{dec:+d}°" if dec else "0°", s, size=20)
+    pole = np.arange(-80, 80.5, 0.5)
+    for hour in range(24):
+        x, y = curve(np.full_like(pole, hour * 15), pole, "#2e2e31", 0.9 * s)
+        near = np.flatnonzero((np.abs(y - (h - 64 * s)) < 6 * s) & (x > 0.06 * w) & (x < 0.94 * w))
+        if len(near):
+            plate.label(x[near[0]] + 10 * s, h - 64 * s, f"{hour:02d}h", s, size=20)
+    # The ecliptic, 23.44° to the equator.
+    lam, eps = np.radians(np.arange(0, 360.5, 0.5)), math.radians(23.44)
+    curve(np.degrees(np.arctan2(math.cos(eps) * np.sin(lam), np.cos(lam))) % 360,
+          np.degrees(np.arcsin(math.sin(eps) * np.sin(lam))), MAJOR, 1.0 * s, dashed=True)
+
+    def star(x, y, b):
+        r = (0.8 + 4.2 * b ** 1.4) * s
+        plate.circle(x, y, r, hexmix("#3e3e42", "#dcdcdc", b ** 0.6))
+        return r
+
+    for _ in range(1700):
+        star(rng.uniform(0, w), rng.uniform(0, h), rng.random() ** 5)
+
+    centres = scatter(w, h, 620 * s, rng, lambda x, y: 0.12 * w < x < 0.88 * w and 0.16 * h < y < 0.84 * h)[:6]
+    accent = min(range(len(centres)), key=lambda i: math.hypot(centres[i][0] - 0.62 * w, centres[i][1] - 0.42 * h))
+    for n, (cx, cy) in enumerate(centres):
+        k = int(rng.integers(5, 9))
+        pts = [(cx + rng.normal(0, 160 * s), cy + rng.normal(0, 130 * s)) for _ in range(k)]
+        bright = rng.uniform(0.35, 1.0, k)
+        radii = [star(x, y, b) for (x, y), b in zip(pts, bright)]
+        # Join them by their minimum spanning tree.
+        inside, edges = {0}, []
+        while len(inside) < k:
+            i, j = min(((i, j) for i in inside for j in range(k) if j not in inside),
+                       key=lambda e: math.dist(pts[e[0]], pts[e[1]]))
+            inside.add(j)
+            edges.append((i, j))
+        for i, j in edges:
+            (ax, ay), (bx, by) = pts[i], pts[j]
+            length = math.dist(pts[i], pts[j])
+            gap_a, gap_b = radii[i] + 12 * s, radii[j] + 12 * s
+            if length > gap_a + gap_b + 6 * s:
+                ux, uy = (bx - ax) / length, (by - ay) / length
+                plate.line([(ax + ux * gap_a, ay + uy * gap_a), (bx - ux * gap_b, by - uy * gap_b)],
+                           LAVENDER if n == accent else MAJOR, 1.3 * s)
+        if n == accent:
+            b = int(np.argmax(bright))
+            plate.label(pts[b][0] + radii[b] + 10 * s, pts[b][1] - radii[b] - 4 * s, "α", s, size=28)
+    return plate.finish(seed)
+
+
+# --- rings -------------------------------------------------------------------
+
+def render_rings(w, h, seed):
+    """The end of a sawn log: growth rings around an off-centre pith, wide
+    when the tree was young, the bark around them, and a few cracks where the
+    wood dried. One ring in green."""
+    rng = np.random.default_rng(seed + 8)
+    s = h / 2160
+    xx, yy = coords(w, h)
+    px, py = 0.52 * w, 0.52 * h
+    theta = np.arctan2(yy - py, xx - px)
+    phases = rng.uniform(0, 2 * np.pi, 4)
+
+    def outline(t):
+        """The log's radius from the pith at angle t."""
+        return 0.40 * h * (1 + 0.09 * np.cos(t - 2.4)) * (1 + 0.03 * np.sin(3 * t + phases[0])
+                                                          + 0.018 * np.sin(5 * t + phases[1]) + 0.01 * np.sin(9 * t + phases[2]))
+
+    rho = np.hypot(xx - px, yy - py) / outline(theta)
+    rho = rho + 0.006 * (noise(w, h, rng, 0.05 * h, 3, 0.5) - 0.5)
+    years = 74
+    widths = rng.gamma(5, 1, years) * np.exp(-np.arange(years) / years * 1.1)
+    bounds = np.concatenate([[0], np.cumsum(widths)])
+    bounds /= bounds[-1]
+    ring = np.interp(rho, bounds, np.arange(years + 1))
+    arr = ground(w, h)
+    contour_lines(arr, ring, 1, s, every=10, accent=GREEN, accent_level=42,
+                  mask=(1 - smoothstep(0.985, 1.0, rho)).astype(np.float32))
+    plate = Plate(arr)
+
+    t = np.linspace(0, 2 * np.pi, 1440)
+    r_in, r_out = outline(t), outline(t) * (1.05 + 0.012 * np.sin(17 * t + phases[3]))
+    plate.line(list(zip(px + r_in * np.cos(t), py + r_in * np.sin(t))), MAJOR, 1.6 * s)
+    plate.line(list(zip(px + r_out * np.cos(t), py + r_out * np.sin(t))), MAJOR, 1.4 * s)
+    for a in rng.uniform(0, 2 * np.pi, 260):              # the bark's furrows
+        r0 = float(outline(a)) * 1.008
+        r1 = r0 * rng.uniform(1.012, 1.04)
+        plate.line([(px + r0 * math.cos(a), py + r0 * math.sin(a)), (px + r1 * math.cos(a), py + r1 * math.sin(a))],
+                   MINOR, 1.0 * s)
+    for a in rng.uniform(0, 2 * np.pi) + np.arange(3) * 2.1 + rng.uniform(-0.4, 0.4, 3):  # checks, opening toward the bark
+        r_edge = float(outline(a)) * 1.002
+        depth = rng.uniform(0.35, 0.65)
+        steps = np.linspace(1, depth, 24)
+        wobble = np.cumsum(rng.normal(0, 0.012, 24))
+        half = 9 * s * (steps - depth) / (1 - depth) + 0.4 * s
+        left, right = [], []
+        for f, dw, hw in zip(steps, wobble, half):
+            ang = a + dw
+            x, y = px + r_edge * f * math.cos(ang), py + r_edge * f * math.sin(ang)
+            nx, ny = -math.sin(ang), math.cos(ang)
+            left.append((x + nx * hw, y + ny * hw))
+            right.append((x - nx * hw, y - ny * hw))
+        plate.polygon(left + right[::-1], "#131315")
+    plate.circle(px, py, 2.5 * s, MARK)
+    # Name the green ring where it crosses the horizontal to the right.
+    xs = np.arange(int(px), w)
+    k = int(np.argmin(np.abs(ring[int(py), xs] - 42)))
+    plate.label(xs[k] + 12 * s, py - 12 * s, "42", s)
+    return plate.finish(seed)
 
 
 # --- main --------------------------------------------------------------------
 
 RENDERERS = {
-    "code": ("1-min-code.png", render_code),
-    "silk": ("2-silk.jpg", render_silk),
-    "dunes": ("3-dunes.jpg", render_dunes),
-    "lake": ("4-lake.jpg", render_lake),
-    "planet": ("5-planet.jpg", render_planet),
-    "flow": ("6-flow.jpg", render_flow),
-    "topography": ("7-topography.jpg", render_topography),
-    "window": ("8-window.jpg", render_window),
+    "topography": ("1-topography.jpg", render_topography),
+    "ridgelines": ("2-ridgelines.jpg", render_ridgelines),
+    "rivers": ("3-rivers.jpg", render_rivers),
+    "globe": ("4-globe.jpg", render_globe),
+    "circuit": ("5-circuit.jpg", render_circuit),
+    "lunar": ("6-lunar.jpg", render_lunar),
+    "nautical": ("7-nautical.jpg", render_nautical),
+    "stars": ("8-stars.jpg", render_stars),
+    "rings": ("9-rings.jpg", render_rings),
 }
 
 
@@ -831,10 +934,7 @@ def main():
         filename, render = RENDERERS[name]
         img = render(args.width, args.height, args.seed)
         path = os.path.join(args.out, filename)
-        if path.endswith(".jpg"):
-            img.save(path, quality=92, subsampling=0, optimize=True)
-        else:
-            img.save(path, optimize=True)
+        img.save(path, quality=92, subsampling=0, optimize=True)
         print(f"Wrote {path} ({args.width}x{args.height}, {os.path.getsize(path) // 1024} KB)")
 
 
